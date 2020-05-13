@@ -4,6 +4,8 @@ require "action_view"
 require "active_support/configurable"
 require "view_component/collection"
 require "view_component/previewable"
+require "view_component/collection_slot"
+require "view_component/slot"
 
 module ViewComponent
   class Base < ActionView::Base
@@ -15,6 +17,9 @@ module ViewComponent
 
     class_attribute :content_areas
     self.content_areas = [] # class_attribute:default doesn't work until Rails 5.2
+
+    class_attribute :slots
+    self.slots = []
 
     # Entrypoint for rendering components.
     #
@@ -133,6 +138,45 @@ module ViewComponent
 
       instance_variable_set("@#{area}".to_sym, content)
       nil
+    end
+
+    def slot(slot, **args, &block)
+      unless slots.include?(slot_class(slot))
+        raise ArgumentError.new "Unknown slot '#{slot}' - expected one of '#{slots.map(&:to_sym)}'"
+      end
+
+      # Instantiate slot class, accommodating zero-argument initializers
+      slot_instance =
+        if slot_class(slot).instance_method(:initialize).parameters.last&.length
+          slot_class(slot).new(args)
+        else
+          slot_class(slot).new
+        end
+
+      # Capture block and assign to slot_instance#content
+      slot_instance.content = view_context.capture(&block) if block_given?
+
+      if slot_class(slot).superclass == ViewComponent::CollectionSlot
+        # If slot is a CollectionSlot, append the slot instance to the array
+        accessor_name = "@#{ActiveSupport::Inflector.pluralize(slot)}"
+
+        new_value =
+          if instance_variable_defined?(accessor_name)
+            instance_variable_get(accessor_name) << slot_instance
+          else
+            [slot_instance]
+          end
+
+        instance_variable_set(accessor_name, new_value)
+      else
+        # Otherwise, assign the Slot instance to the slot accessor to be the slot instance
+        instance_variable_set("@#{slot}".to_sym, slot_instance)
+      end
+      nil
+    end
+
+    def slot_class(slot_symbol)
+      "#{self.class.name}::#{slot_symbol.to_s.capitalize}".constantize
     end
 
     private
@@ -282,6 +326,39 @@ module ViewComponent
         end
         attr_reader(*areas)
         self.content_areas = areas
+      end
+
+      # support initalizing slots as:
+      #
+      # with_slots :header
+      def with_slots(*slots)
+        # Generate a new slot class based on symbol
+        # For example: :header => MyComponent::Header < ViewComponent::Slot
+        slots.each do |slot|
+          self.class_eval("class #{slot.to_s.capitalize} < ViewComponent::Slot; end")
+        end
+      end
+
+      # support initalizing collection slots as:
+      #
+      # with_collection_slots :tab
+      def with_collection_slots(*slots)
+        # Generate a new slot class based on symbol
+        # For example: :tab => MyComponent::Tab < ViewComponent::CollectionSlot
+        slots.each do |slot|
+          self.class_eval("class #{slot.to_s.capitalize} < ViewComponent::CollectionSlot; end")
+        end
+      end
+
+      def register_slot(klass)
+        if klass.superclass == ViewComponent::CollectionSlot
+          # If slot is a collection, pluralize the name of the slot (Item => items)
+          attr_accessor ActiveSupport::Inflector.pluralize(klass.name.demodulize.downcase).to_sym
+        else
+          attr_accessor klass.name.demodulize.downcase.to_sym
+        end
+
+        self.slots << klass
       end
 
       # Support overriding collection parameter name
